@@ -238,15 +238,14 @@ enum tree_direction { NONE, LEFT, RIGHT };
 #define SMA_PAGE_SIZE 262144
 #endif
 
-static void *sma_head = NULL;
-static uintptr_t *sma_lastpage = NULL;
-static unsigned int sma_pages = 0;
-static size_t sma_lastfree = 0;
+static void *sma_head = NULL, *sma_free_head = NULL;
+static uintptr_t *sma_lastpage = NULL, *sma_free_lastpage = NULL;
+static unsigned int sma_pages = 0, sma_free_pages = 0;
 static size_t sma_nextfree = sizeof(uintptr_t);
+static size_t sma_free_nextfree = sizeof(uintptr_t);
+static unsigned int sma_free_count = 0, sma_free_largest = 0;
 #ifdef DEBUG
-static uintmax_t sma_allocs = 0;
-static uintmax_t sma_free_ignored = 0;
-static uintmax_t sma_free_good = 0;
+static uintmax_t sma_allocs = 0, sma_frees = 0;
 #endif
 
 
@@ -276,7 +275,7 @@ static void dump_string_table(void)
 */
 
 
-static inline void *string_malloc_page(void)
+static inline void *string_malloc_page(uintptr_t * const lastpage)
 {
 	uintptr_t * restrict pageptr;
 
@@ -285,22 +284,18 @@ static inline void *string_malloc_page(void)
 	if (pageptr == NULL) return NULL;
 	*pageptr = (uintptr_t)NULL;
 	/* Link this page to the previous page */
-	*(pageptr + sizeof(uintptr_t)) = (uintptr_t)sma_lastpage;
+	*(pageptr + sizeof(uintptr_t)) = (uintptr_t)lastpage;
 
 	/* Link previous page to this page, if applicable */
-	if (sma_lastpage != NULL) *sma_lastpage = (uintptr_t)pageptr;
+	if (lastpage != NULL) *lastpage = (uintptr_t)pageptr;
 
-	/* Update last page pointers and total page counter */
-	sma_lastpage = pageptr;
-	sma_pages++;
-
-	return (char *)pageptr;
+	return (void *)pageptr;
 }
 
 
 static void *string_malloc(size_t len)
 {
-	const char * restrict page = (char *)sma_lastpage;
+	uintptr_t *page = (uintptr_t *)sma_lastpage;
 	static char *address;
 
 	/* Calling with no actual length is invalid */
@@ -319,16 +314,26 @@ static void *string_malloc(size_t len)
 
 	/* Initialize on first use */
 	if (sma_pages == 0) {
-		sma_head = string_malloc_page();
+		sma_head = string_malloc_page(NULL);
 		if (!sma_head) return NULL;
+		sma_lastpage = sma_head;
+		sma_pages++;
 		sma_nextfree = (2 * sizeof(uintptr_t));
+		/* Also allocate the free list here */
+		sma_free_head = string_malloc_page(NULL);
+		if (!sma_free_head) return NULL;
+		sma_free_lastpage = sma_free_head;
+		sma_free_pages++;
+		sma_free_nextfree = sizeof(uintptr_t);
 		page = sma_head;
 	}
 
 	/* Allocate new pages when objects don't fit anymore */
 	if ((sma_nextfree + len) > SMA_PAGE_SIZE) {
-		page = string_malloc_page();
+		page = string_malloc_page(sma_lastpage);
 		if (!page) return NULL;
+		sma_lastpage = page;
+		sma_pages++;
 		sma_nextfree = (2 * sizeof(uintptr_t));
 	}
 
@@ -337,7 +342,6 @@ static void *string_malloc(size_t len)
 	/* Prefix object with its size */
 	*(size_t *)address = (size_t)len;
 	address += sizeof(size_t);
-	sma_lastfree = sma_nextfree;
 	sma_nextfree += len;
 
 #ifdef DEBUG
@@ -347,34 +351,33 @@ static void *string_malloc(size_t len)
 }
 
 
-/* Roll back the last allocation */
+/* Free chunks of memory */
 static inline void string_free(const void * restrict addr)
 {
 	static const char * restrict p;
+	int size;
 
-	/* Do nothing on NULL address or no last length */
-	if ((addr == NULL) || (sma_lastfree < sizeof(uintptr_t))) {
-#ifdef DEBUG
-		sma_free_ignored++;
-#endif
+	/* Do nothing on NULL address */
+	if (sma_free_head == NULL || addr == NULL) return;
+
+	p = (char *)addr - sizeof(size_t);
+	size = *p;
+
+	/* Catch attempts to free something that's too big */
+	if (size > (SMA_PAGE_SIZE - (2 * sizeof(uintptr_t)) - sizeof(size_t))) {
 		return;
 	}
 
-	p = (char *)sma_lastpage + sma_lastfree;
+	/* Record largest free object ever seen for optimization
+	 * This allows string_malloc() to skip the free list if
+	 * there's never been a freed object large enough to hold what
+	 * is being allocated. It will not ever shrink. */
+	if (size > sma_free_largest) sma_free_largest = size;
 
-	/* Only take action on the last pointer in the page */
-	addr = (void *)((uintptr_t)addr - sizeof(size_t));
-	if ((uintptr_t)addr != (uintptr_t)p) {
-#ifdef DEBUG
-		sma_free_ignored++;
-#endif
-		return;
-	}
+	/* Find next free slot and store the freed object */
 
-	sma_nextfree = sma_lastfree;
-	sma_lastfree = 0;
 #ifdef DEBUG
-	sma_free_good++;
+	sma_frees++;
 #endif
 	return;
 }
@@ -391,6 +394,15 @@ static inline void string_malloc_destroy(void)
 		free(cur);
 		cur = (void *)next;
 		sma_pages--;
+	}
+	sma_head = NULL;
+
+	cur = (void *)sma_free_head;
+	while (sma_free_pages > 0) {
+		next = (uintptr_t *)*(uintptr_t *)cur;
+		free(cur);
+		cur = (void *)next;
+		sma_free_pages--;
 	}
 	sma_head = NULL;
 	return;
@@ -2147,8 +2159,8 @@ skip_full_check:
     fprintf(stderr, "%ju total files, %ju comparisons, branch L %u, R %u, both %u\n",
 		    filecount, comparisons, left_branch, right_branch,
 		    left_branch + right_branch);
-    fprintf(stderr, "Max tree depth: %u; SMA alloc: %ju, free ign: %ju, free good: %ju\n",
-		    max_depth, sma_allocs, sma_free_ignored, sma_free_good);
+    fprintf(stderr, "Max tree depth: %u; SMA alloc: %ju, free: %ju\n",
+		    max_depth, sma_allocs, sma_frees);
   }
 #endif /* DEBUG */
 
